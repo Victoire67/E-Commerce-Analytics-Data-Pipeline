@@ -1,0 +1,39 @@
+[project]
+name = "ecommerce-pipeline"
+version = "0.1.0"
+description = "E-commerce analytics data pipeline: PostgreSQL (3NF + JSONB), Redis caching, MongoDB sessions, and SQL performance analysis."
+authors = [{ name = "victoire67", email = "ansimavicky@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "psycopg2-binary (>=2.9.10,<3.0.0)",
+    "redis (>=5.0.0,<7.0.0)",
+    "pymongo (>=4.8.0,<5.0.0)",
+    "python-dotenv (>=1.0.0,<2.0.0)",
+    "faker (>=30.0.0)",
+]
+
+[tool.poetry]
+packages = [{ include = "ecommerce_pipeline", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+pytest-cov = "^6.0"
+ruff = "^0.8"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S"]
+ignore = ["S101"]  # allow assert in tests
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

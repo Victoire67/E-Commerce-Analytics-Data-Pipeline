@@ -1,0 +1,8 @@
+async-timeout==5.0.1 ; python_version >= "3.11" and python_full_version < "3.11.3"
+dnspython==2.9.1 ; python_version >= "3.11" and python_version < "4.0"
+faker==40.44.0 ; python_version >= "3.11" and python_version < "4.0"
+psycopg2-binary==2.9.13 ; python_version >= "3.11" and python_version < "4.0"
+pymongo==4.19.0 ; python_version >= "3.11" and python_version < "4.0"
+python-dotenv==1.2.4 ; python_version >= "3.11" and python_version < "4.0"
+redis==6.4.0 ; python_version >= "3.11" and python_version < "4.0"
+tzdata==2026.6 ; python_version >= "3.11" and python_version < "4.0" and platform_system == "Windows"
