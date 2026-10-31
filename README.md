@@ -35,6 +35,50 @@ poetry run python scripts/check_connections.py
 Useful commands: `docker compose logs <service>`, `docker compose down` (stop, keep data),
 `docker compose down -v` (stop and delete all data).
 
+## Loading data
+
+```bash
+poetry run python scripts/create_tables.py          # create schema (add --reset to recreate)
+poetry run python scripts/seed_data.py              # 10k customers, 500 products, 100k orders
+```
+
+The seeder ([src/ecommerce_pipeline/seed.py](src/ecommerce_pipeline/seed.py)) uses Faker with a
+fixed seed, so every run produces the same dataset. Rows are bulk-inserted with
+`execute_values` in batches of 5,000 (~30 s for the full dataset). Popularity is skewed so a few
+customers and products dominate, like real store data, and `metadata` differs per category
+(sizes/colors/material for clothing, brand/warranty/specs for electronics, author/pages for books).
+The large volume is deliberate: on a few hundred rows PostgreSQL always uses a sequential scan, so
+index improvements are only measurable at scale.
+
+For a small, readable dataset instead, load the hand-written SQL file:
+
+```bash
+docker exec -i ecommerce-postgres psql -U ecommerce_user -d ecommerce < sql/03_sample_data.sql
+```
+
+## Python API (CRUD)
+
+All database access goes through a `ThreadedConnectionPool`
+([db.py](src/ecommerce_pipeline/db.py)); `transaction()` commits on success and rolls back on any
+exception. Every query in [crud.py](src/ecommerce_pipeline/crud.py) is parameterized (`%s`), so
+input is never interpolated into SQL.
+
+```python
+from ecommerce_pipeline import crud
+
+customer_id = crud.create_customer("Amina", "Uwase", "amina@example.com", country="Rwanda")
+shirt = crud.add_product("CLO-1", "T-Shirt", "Clothing", 19.99, stock_quantity=10,
+                         metadata={"colors": ["red"], "sizes": ["M", "L"]})
+order_id = crud.create_order(customer_id, [(shirt, 2)])
+crud.get_customer_orders(customer_id)   # orders with line items and computed totals
+```
+
+`create_order()` is a single ACID transaction: it locks the product rows
+(`SELECT ... FOR UPDATE`, in a fixed order to avoid deadlocks), checks the customer, products and
+stock, inserts the order and its lines at the current price, and decrements stock. Any failure
+(`InsufficientStockError`, `ProductNotFoundError`, `CustomerNotFoundError`) rolls back everything,
+so partial orders and overselling are impossible.
+
 ## Database Design
 
 ### ER diagram
@@ -120,9 +164,14 @@ Deliberate choices:
 ## Development
 
 ```bash
-poetry run pytest       # run the test suite
+poetry run pytest       # run the test suite (needs `docker compose up -d`)
 poetry run ruff check . # lint
 ```
+
+Tests run against a separate `ecommerce_test` database that is created automatically, rebuilt
+once per session and truncated before each test, so your seeded data is never touched. They
+cover CRUD, constraint violations, SQL-injection safety, transaction rollback, concurrent
+ordering without overselling, and the seed generator.
 
 `requirements.txt` is generated from the lock file for non-Poetry users:
 
