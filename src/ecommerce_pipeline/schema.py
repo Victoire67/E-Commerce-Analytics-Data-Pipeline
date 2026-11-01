@@ -34,3 +34,31 @@ def list_tables(conn: PgConnection) -> list[str]:
             "WHERE table_schema = 'public' ORDER BY table_name"
         )
         return [row[0] for row in cur.fetchall()]
+
+
+INDEXES_FILE = SQL_DIR / "02_indexes.sql"
+PERFORMANCE_INDEXES = ("idx_orders_customer_id", "idx_products_metadata_gin")
+
+
+def create_indexes(conn: PgConnection) -> None:
+    """Apply 02_indexes.sql (B-tree on orders.customer_id, GIN on products.metadata)."""
+    sql_text = INDEXES_FILE.read_text(encoding="utf-8")
+    with conn, conn.cursor() as cur:
+        cur.execute(sql_text)
+
+
+def drop_indexes(conn: PgConnection) -> None:
+    """Remove the performance indexes (used to measure the 'before' state)."""
+    with conn, conn.cursor() as cur:
+        for index in PERFORMANCE_INDEXES:
+            # Names come from the fixed PERFORMANCE_INDEXES tuple, never user input.
+            cur.execute(f"DROP INDEX IF EXISTS {index}")  # noqa: S608
+        cur.execute("ANALYZE orders")
+        cur.execute("ANALYZE products")
+
+
+def list_indexes(conn: PgConnection) -> list[str]:
+    """Names of all indexes in the public schema."""
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT indexname FROM pg_indexes WHERE schemaname = 'public' ORDER BY 1")
+        return [row[0] for row in cur.fetchall()]
