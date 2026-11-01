@@ -39,7 +39,7 @@ Useful commands: `docker compose logs <service>`, `docker compose down` (stop, k
 
 ```bash
 poetry run python scripts/create_tables.py          # create schema (add --reset to recreate)
-poetry run python scripts/seed_data.py              # 10k customers, 500 products, 100k orders
+poetry run python scripts/seed_data.py              # 10k customers, 20k products, 100k orders
 ```
 
 The seeder ([src/ecommerce_pipeline/seed.py](src/ecommerce_pipeline/seed.py)) uses Faker with a
@@ -160,6 +160,69 @@ Deliberate choices:
 - `UNIQUE` on `customers.email`, `products.sku`, `categories.name`.
 - `CHECK`: price/unit_price ≥ 0, stock ≥ 0, quantity > 0, order status in a fixed set,
   basic email shape, metadata must be a JSON object.
+
+## Optimization report
+
+Indexes live in [sql/02_indexes.sql](sql/02_indexes.sql), separate from the schema, so their
+effect can be measured. [scripts/benchmark.py](scripts/benchmark.py) drops them, runs each
+query with `EXPLAIN (ANALYZE, BUFFERS)` (one warm-up run, then the median of 7), applies the
+indexes, and measures again. Full before/after plans: [docs/benchmark_results.md](docs/benchmark_results.md).
+
+```bash
+poetry run python scripts/benchmark.py
+```
+
+**Dataset:** 10,000 customers · 20,000 products · 100,000 orders · 250,433 order items
+(PostgreSQL 16 in Docker, warm cache). Customer 5000 has 10 orders.
+
+| Query | Before | After | Speedup | Pages read |
+|---|---|---|---:|---:|
+| Orders of one customer (`WHERE customer_id = $1`) | Seq Scan · 4.505 ms | Bitmap Index Scan on `idx_orders_customer_id` · 0.062 ms | **72.7×** | 812 → 12 |
+| `get_customer_orders()` (orders ⨝ items ⨝ products) | Seq Scan on orders · 4.383 ms | Bitmap Index Scan on `idx_orders_customer_id` · 0.178 ms | **24.6×** | 924 → 124 |
+| `metadata @> '{"brand":"Voltix","warranty_months":36}'` (128 rows) | Seq Scan · 3.795 ms | Bitmap Index Scan on `idx_products_metadata_gin` · 0.446 ms | **8.5×** | 488 → 134 |
+| `metadata @> '{"colors":["red"],"sizes":["XS"],"material":"leather"}'` (94 rows) | Seq Scan · 4.074 ms | Bitmap Index Scan on GIN · 0.531 ms | **7.7×** | 488 → 112 |
+| `metadata ? 'warranty_months'` (3,338 rows, ~17%) | Seq Scan · 2.558 ms | Bitmap Index Scan on GIN · 1.354 ms | 1.9× | 488 → 492 |
+
+Index sizes: `idx_orders_customer_id` 920 kB, `idx_products_metadata_gin` 688 kB.
+
+### Reading the plans
+
+**B-tree on `orders.customer_id`.** Before the index, the plan for "orders of customer 5000"
+is a `Seq Scan` that reads all 812 pages of `orders` and throws away 99,990 of 100,000 rows
+(`Rows Removed by Filter: 99990`) to keep 10. PostgreSQL indexes primary keys and UNIQUE
+columns automatically, but **not foreign keys**, so this lookup (the core of
+`get_customer_orders()`) was a full scan. With the B-tree, a `Bitmap Index Scan` finds the 10
+row locations by walking the tree (2 index pages), then the `Bitmap Heap Scan` reads only the 10
+table pages that hold them. 812 pages became 12 and time dropped 73×. The join query improves
+less (25×) because its remaining cost is the 25 order-item and product lookups, which already
+used primary-key indexes. A sequential scan's cost grows with the size of the table; an index
+lookup's cost grows with the number of matching rows, so the gap widens as `orders` grows.
+
+**GIN on `products.metadata`.** A B-tree can't search inside a JSON document. A GIN index
+stores every key and value of every document and maps each to the rows that contain it, so
+`@>` finds the posting lists for `"brand":"Voltix"` and `"warranty_months":36` and intersects
+them. Selective containment queries (≈0.5% of products) go from reading all 488 pages to about
+120: **~8× faster**.
+
+**When an index doesn't help much.** `metadata ? 'warranty_months'` matches 17% of products.
+The index still finds them, but the heap scan then visits almost every page anyway (488 → 492),
+so the gain is small (1.9×). If the filter matched most of the table, the planner would rightly
+keep the sequential scan. Indexes pay off for *selective* predicates.
+
+### Trade-offs and decisions
+
+- **Write cost.** Each index must be updated on every `INSERT`/`UPDATE` of its column. GIN is
+  the most expensive to maintain, which is acceptable for a product catalogue (read-heavy, rarely
+  written). Both indexes add 1.6 MB in total.
+- **`jsonb_ops` vs `jsonb_path_ops`.** `jsonb_path_ops` builds a smaller, faster index but
+  only supports `@>`. The default `jsonb_ops` was kept because the API also uses the key
+  operators `?` and `?|`.
+- **`ANALYZE` after indexing and seeding** refreshes the planner's statistics. Without fresh
+  statistics the planner can misjudge how many rows match and pick the wrong plan.
+- **Measured, not assumed.** Timings are medians of repeated runs on a warm cache, and the
+  page counts (`BUFFERS`) are included because they don't depend on cache state.
+- **Further candidates** (not needed by the current queries): `orders(order_date)` for monthly
+  reports over a date range, and `order_items(product_id)` for "who bought product X" lookups.
 
 ## Development
 
