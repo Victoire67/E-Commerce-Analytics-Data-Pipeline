@@ -13,6 +13,7 @@ import random
 import time
 from dataclasses import dataclass
 from decimal import Decimal
+from itertools import accumulate
 
 from faker import Faker
 from psycopg2.extras import Json, execute_values
@@ -178,7 +179,9 @@ def seed_orders(
     rankings and best-seller lists look like real store data.
     """
     customer_weights = [1 / (rank + 1) ** 0.5 for rank in range(len(customer_ids))]
-    product_weights = [1 / (rank + 1) ** 0.8 for rank in range(len(products))]
+    # Cumulative weights are computed once: passing plain weights to choices() would
+    # re-accumulate them on every call, which is O(products) per order.
+    product_cum_weights = list(accumulate(1 / (rank + 1) ** 0.8 for rank in range(len(products))))
     total_items = 0
 
     for start in range(0, count, BATCH_SIZE):
@@ -202,7 +205,10 @@ def seed_orders(
             )
             items = []
             for (order_id,) in order_ids:
-                lines = {pid: price for pid, price in rng.choices(products, product_weights, k=4)}
+                lines = {
+                    pid: price
+                    for pid, price in rng.choices(products, cum_weights=product_cum_weights, k=4)
+                }
                 for product_id, price in list(lines.items())[: rng.randint(1, 4)]:
                     items.append((order_id, product_id, rng.randint(1, 3), price))
             execute_values(
@@ -223,7 +229,7 @@ def analyze() -> None:
 
 def seed_all(
     customers: int = 10_000,
-    products: int = 500,
+    products: int = 20_000,
     orders: int = 100_000,
     seed: int = 42,
 ) -> SeedResult:
