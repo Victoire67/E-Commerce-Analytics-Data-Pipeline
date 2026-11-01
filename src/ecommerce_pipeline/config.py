@@ -16,6 +16,7 @@ class Settings:
     postgres_password: str
     redis_host: str
     redis_port: int
+    redis_db: int
     mongo_host: str
     mongo_port: int
     mongo_db: str
@@ -52,6 +53,7 @@ def load_settings() -> Settings:
         postgres_password=os.getenv("POSTGRES_PASSWORD", ""),
         redis_host=os.getenv("REDIS_HOST", "localhost"),
         redis_port=int(os.getenv("REDIS_PORT", "6379")),
+        redis_db=int(os.getenv("REDIS_DB", "0")),
         mongo_host=os.getenv("MONGO_HOST", "localhost"),
         mongo_port=int(os.getenv("MONGO_PORT", "27017")),
         mongo_db=os.getenv("MONGO_DB", "ecommerce_sessions"),
