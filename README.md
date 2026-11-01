@@ -1,7 +1,89 @@
 # E-Commerce Analytics Data Pipeline
 
+[![CI](https://github.com/Victoire67/E-Commerce-Analytics-Data-Pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Victoire67/E-Commerce-Analytics-Data-Pipeline/actions/workflows/ci.yml)
+
 Data processing and analytics pipeline for a fictional e-commerce store, built on
 PostgreSQL (3NF schema + JSONB), Redis (best-seller cache), and MongoDB (sessions/carts).
+
+```bash
+poetry install && cp .env.example .env && docker compose up -d
+poetry run python scripts/run_demo.py      # runs everything end to end (seeds on first run)
+```
+
+## Contents
+
+- [Architecture](#architecture) · [Prerequisites](#prerequisites) · [Setup](#setup) ·
+  [Loading data](#loading-data)
+- [Python API (CRUD)](#python-api-crud) · [SQL + NoSQL integration](#sql--nosql-integration) ·
+  [Analytics queries](#analytics-queries)
+- [Database design (ER diagram, 3NF)](#database-design) ·
+  [Optimization report](#optimization-report) · [Development & testing](#development)
+- [Requirements checklist](#requirements-checklist)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph App["Python 3.11+ application (src/ecommerce_pipeline)"]
+        CRUD["crud.py<br/>create_order() · add_product()<br/>get_customer_orders()"]
+        AN["analytics.py<br/>RANK() · CTEs · LAG()"]
+        META["product_metadata.py<br/>JSONB @> ? ||"]
+        CACHE["cache.py<br/>cache-aside"]
+        SESS["sessions.py<br/>SessionStore"]
+        CO["checkout.py"]
+    end
+    PG[("PostgreSQL 16<br/>3NF tables + JSONB<br/>B-tree + GIN indexes")]
+    RD[("Redis 7<br/>top-10 best sellers<br/>TTL 5 min")]
+    MG[("MongoDB 7<br/>sessions + carts<br/>TTL 30 min idle")]
+
+    CRUD -- "ThreadedConnectionPool<br/>ACID transactions" --> PG
+    AN --> PG
+    META --> PG
+    CACHE -- "miss: ranking query" --> AN
+    CACHE -- "GET / SET EX" --> RD
+    SESS -- pymongo --> MG
+    CO -- "1 read cart" --> SESS
+    CO -- "2 create_order()" --> CRUD
+    CO -- "3 invalidate" --> CACHE
+```
+
+Each store holds the data it is best at:
+
+| Data | Store | Why |
+|---|---|---|
+| Customers, products, orders, order items | **PostgreSQL** (3NF) | Money and stock need constraints, foreign keys and ACID transactions. This is the source of truth. |
+| Product attributes (sizes, colors, specs…) | **PostgreSQL JSONB** | Attributes differ per category. JSONB keeps them flexible but still queryable, indexable (GIN) and transactional with the product row. |
+| Top-10 best sellers | **Redis** | The ranking aggregates ~250k order lines (≈225 ms) but is read on every page. A cached copy answers in <1 ms, and losing it costs only one recomputation. |
+| Sessions and carts | **MongoDB** | Short-lived, self-contained documents of varying shape, read/written whole on every request, expired automatically by a TTL index. They become relational data only at checkout. |
+
+### Project structure
+
+```
+├── docker-compose.yml          PostgreSQL, Redis, MongoDB (healthchecks, named volumes)
+├── pyproject.toml / poetry.lock / requirements.txt
+├── .env.example                every setting, copied to .env
+├── sql/
+│   ├── 01_schema.sql           DDL: 3NF tables, PK/FK/UNIQUE/CHECK constraints
+│   ├── 02_indexes.sql          B-tree on orders.customer_id, GIN on products.metadata
+│   ├── 03_sample_data.sql      small hand-written dataset
+│   └── analytics_queries.sql   window-function, CTE and JSONB queries for psql
+├── src/ecommerce_pipeline/
+│   ├── config.py               settings from .env
+│   ├── db.py                   connection pool + transaction() context manager
+│   ├── schema.py               create/drop tables and indexes from the SQL files
+│   ├── crud.py                 customers, products, transactional orders
+│   ├── product_metadata.py     JSONB queries and updates
+│   ├── analytics.py            RANK(), CTEs, LAG()
+│   ├── cache.py                Redis cache-aside for best sellers
+│   ├── sessions.py             MongoDB sessions and carts
+│   ├── checkout.py             MongoDB cart -> PostgreSQL order -> Redis invalidation
+│   ├── seed.py                 bulk Faker data generator
+│   └── benchmark.py            EXPLAIN ANALYZE before/after harness
+├── scripts/                    check_connections, create_tables, seed_data, benchmark, run_demo
+├── tests/                      68 pytest tests (real PostgreSQL, Redis, MongoDB)
+├── docs/benchmark_results.md   full EXPLAIN ANALYZE plans
+└── .github/workflows/ci.yml    lint + tests + smoke run on every push
+```
 
 ## Prerequisites
 
@@ -24,7 +106,15 @@ docker compose ps        # wait until all three show "(healthy)"
 
 # 4. Verify Python can reach all three services
 poetry run python scripts/check_connections.py
+
+# 5. Create tables, load data, and run the full demo
+poetry run python scripts/create_tables.py
+poetry run python scripts/seed_data.py
+poetry run python scripts/run_demo.py
 ```
+
+Without Poetry: `python -m venv .venv`, activate it, `pip install -r requirements.txt`, and
+run the scripts with `PYTHONPATH=src`.
 
 | Service    | Image              | Host port (default) | Used for                          |
 |------------|--------------------|---------------------|-----------------------------------|
@@ -78,6 +168,106 @@ crud.get_customer_orders(customer_id)   # orders with line items and computed to
 stock, inserts the order and its lines at the current price, and decrements stock. Any failure
 (`InsufficientStockError`, `ProductNotFoundError`, `CustomerNotFoundError`) rolls back everything,
 so partial orders and overselling are impossible.
+
+## SQL + NoSQL integration
+
+### PostgreSQL JSONB: product metadata
+
+[product_metadata.py](src/ecommerce_pipeline/product_metadata.py)
+
+```python
+from ecommerce_pipeline import product_metadata as pm
+
+pm.find_products_by_metadata({"colors": ["red"], "sizes": ["XS"], "material": "leather"})  # @>
+pm.find_products_by_metadata({"specs": {"wireless": True}})       # nested containment
+pm.find_products_with_any_key(["warranty_months", "sizes"])       # ?|
+pm.count_products_by_attribute("brand")                           # ->> + GROUP BY
+pm.available_colors()                                             # jsonb_array_elements_text
+pm.merge_product_metadata(42, {"limited_edition": True})          # metadata || patch
+pm.remove_metadata_key(42, "limited_edition")                     # metadata - key
+```
+
+The containment and key operators are served by the GIN index (see the
+[optimization report](#optimization-report)).
+
+### Redis: top-10 best sellers (cache-aside)
+
+[cache.py](src/ecommerce_pipeline/cache.py)
+
+```python
+from ecommerce_pipeline import cache
+
+client = cache.get_redis()
+result = cache.get_top_products(client)   # MISS: runs the RANK() query, SET key EX 300
+result = cache.get_top_products(client)   # HIT: served from Redis
+result.from_cache, result.products
+cache.invalidate_top_products(client)     # after new orders
+```
+
+- **Key:** `ecommerce:top_products:10`, holding a JSON array. Decimals are stored as strings so
+  money stays exact.
+- **Expiry:** set atomically with `SET ... EX`. The default TTL is 300 s, so even without
+  invalidation, stale data lives at most 5 minutes.
+- **Invalidation:** checkout calls `invalidate_top_products()` after the order commits. The next
+  read rebuilds the list.
+- **Measured in the demo:** a miss (PostgreSQL aggregation over ~250k lines) takes ~225 ms; a
+  hit takes ~1 ms.
+
+### MongoDB: sessions and carts
+
+[sessions.py](src/ecommerce_pipeline/sessions.py)
+
+```json
+{
+  "_id": "724f6d43fa294f7e82c808f3953280d2",
+  "customer_id": 10001,
+  "created_at": "2026-11-01T10:00:00Z",
+  "last_active": "2026-11-01T10:04:12Z",
+  "device": {"os": "android", "app": "1.4.2"},
+  "cart": [{"product_id": 1, "quantity": 2, "added_at": "2026-11-01T10:01:30Z"}]
+}
+```
+
+```python
+from ecommerce_pipeline.sessions import SessionStore
+
+store = SessionStore.from_settings()            # also creates the indexes
+sid = store.create_session(device={"os": "ios"})
+store.add_to_cart(sid, product_id=7, quantity=2)  # same product again -> quantity += n
+store.attach_customer(sid, customer_id=42)       # login keeps the cart
+store.most_carted_products()                     # aggregation pipeline
+```
+
+- **TTL index** on `last_active` (30 min). MongoDB deletes abandoned sessions by itself. Every
+  cart change refreshes `last_active`.
+- **Atomic cart updates:** a positional `$inc` on `cart.$.quantity` merges lines, and
+  `$push`/`$pull` add or remove them. The whole document is never rewritten.
+
+### Checkout: where the three stores meet
+
+[checkout.py](src/ecommerce_pipeline/checkout.py)
+
+`checkout(store, redis_client, session_id)` reads the MongoDB cart, calls `create_order()` (the
+PostgreSQL ACID transaction is the commit point), then clears the cart and invalidates the
+Redis cache. If the order fails, for example because stock is insufficient, nothing is written
+anywhere and the cart is kept so the customer can retry.
+
+## Analytics queries
+
+[analytics.py](src/ecommerce_pipeline/analytics.py), also runnable in psql from
+[sql/analytics_queries.sql](sql/analytics_queries.sql). Cancelled orders are excluded.
+
+| Function | Technique | Answers |
+|---|---|---|
+| `top_selling_products(10)` | CTE + `RANK() OVER (ORDER BY units_sold DESC)` | Best sellers (the list cached in Redis). Ties share a rank: 1, 2, 2, 4. |
+| `product_rank_by_category(3)` | `RANK() OVER (PARTITION BY category …)` in a CTE, `SUM() OVER` for share | Top products *within* each category and their % of category revenue |
+| `revenue_per_customer(10)` | Chained CTEs: order totals → customer totals → `RANK()` | Highest-value customers, order count, average order value |
+| `monthly_revenue()` | CTE + `LAG()` + running `SUM() OVER` | Month-over-month growth and cumulative revenue |
+
+The window rank is filtered in an outer query (`WHERE category_rank <= 3`) because window
+functions are evaluated after `WHERE`. `RANK` was chosen over `ROW_NUMBER` so equal sellers
+aren't arbitrarily split, and over `DENSE_RANK` so a rank still reflects how many items come
+before it.
 
 ## Database Design
 
@@ -227,17 +417,54 @@ keep the sequential scan. Indexes pay off for *selective* predicates.
 ## Development
 
 ```bash
-poetry run pytest       # run the test suite (needs `docker compose up -d`)
-poetry run ruff check . # lint
+poetry run pytest --cov=ecommerce_pipeline   # 68 tests, 99% coverage (needs docker compose up -d)
+poetry run ruff check . && poetry run ruff format --check .
 ```
 
-Tests run against a separate `ecommerce_test` database that is created automatically, rebuilt
-once per session and truncated before each test, so your seeded data is never touched. They
-cover CRUD, constraint violations, SQL-injection safety, transaction rollback, concurrent
-ordering without overselling, and the seed generator.
+Tests use the real services, each isolated from your data: the `ecommerce_test` PostgreSQL
+database (created automatically, rebuilt once per session, truncated before each test), Redis
+DB 15 (flushed per test), and the `ecommerce_sessions_test` MongoDB database. If a service is
+down, its tests are skipped with a message instead of failing.
+
+| Test file | Covers |
+|---|---|
+| `test_crud.py` | CRUD, UNIQUE/CHECK violations, JSONB round-trip, SQL-injection payload stored verbatim |
+| `test_orders.py` | Order totals, price at purchase, full rollback on bad stock/product/customer, 5 concurrent buyers vs 3 units (no overselling) |
+| `test_product_metadata.py` | `@>` (arrays, nested), `?|`, `->>` grouping, array unnesting, `||` merge, `-` removal |
+| `test_cache.py` | Miss → hit, ranking order, TTL, per-limit keys, stale-until-invalidated, cancelled orders ignored |
+| `test_sessions.py` | Session/cart CRUD, quantity merge, TTL index, aggregation, checkout success/failure across all three stores |
+| `test_analytics.py` | RANK ties, per-category ranks and shares, revenue per customer, LAG growth, running total; hand-computed expected values |
+| `test_benchmark.py` | Index create/drop idempotency, GIN usable for `@>`, EXPLAIN harness and report |
+| `test_seed.py`, `test_infrastructure.py` | Seed volumes/integrity/determinism, settings, URL-encoding, pool reuse, rollback |
+
+GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs lint, the full test suite with
+coverage, and an end-to-end smoke run (create tables → seed → benchmark) against PostgreSQL,
+Redis and MongoDB service containers on every push.
 
 `requirements.txt` is generated from the lock file for non-Poetry users:
 
 ```bash
 poetry export -f requirements.txt --without-hashes -o requirements.txt
 ```
+
+## Requirements checklist
+
+| Lab requirement | Where |
+|---|---|
+| ER diagram; customers, products, orders, order_items | [ER diagram](#er-diagram) |
+| `CREATE TABLE` scripts in 3NF with PK/FK/constraints; normalization documented | [sql/01_schema.sql](sql/01_schema.sql), [Normalization decisions](#normalization-decisions-3nf) |
+| PostgreSQL in Docker; tables created by a Python script | [docker-compose.yml](docker-compose.yml), [scripts/create_tables.py](scripts/create_tables.py) |
+| `psycopg2` with connection pooling | [db.py](src/ecommerce_pipeline/db.py) (`ThreadedConnectionPool`) |
+| `create_order()`, `add_product()`, `get_customer_orders()` | [crud.py](src/ecommerce_pipeline/crud.py) |
+| Parameterized queries (no SQL injection) | All modules use `%s` / `sql.Identifier`; tested in `test_crud.py`, `test_product_metadata.py` |
+| Transactions for order creation (ACID) | `create_order()` + `transaction()`; tested in `test_orders.py` |
+| JSONB product metadata | [product_metadata.py](src/ecommerce_pipeline/product_metadata.py) |
+| Redis cache of top-10 best sellers | [cache.py](src/ecommerce_pipeline/cache.py) |
+| MongoDB sessions/carts with `pymongo` | [sessions.py](src/ecommerce_pipeline/sessions.py), [checkout.py](src/ecommerce_pipeline/checkout.py) |
+| Window functions (`RANK()`) | `top_selling_products()`, `product_rank_by_category()` |
+| CTEs for revenue per customer | `revenue_per_customer()` |
+| `EXPLAIN ANALYZE` inspection | [benchmark.py](src/ecommerce_pipeline/benchmark.py), [docs/benchmark_results.md](docs/benchmark_results.md) |
+| B-tree index on `customer_id` with measured improvement | [sql/02_indexes.sql](sql/02_indexes.sql): 4.5 ms → 0.06 ms (73×) |
+| GIN index on JSONB, efficient metadata queries | [sql/02_indexes.sql](sql/02_indexes.sql): ~4 ms → ~0.5 ms (8×) |
+| SQL files (DDL + sample data) | [sql/](sql/) |
+| `requirements.txt`, Python 3.11+ | [requirements.txt](requirements.txt), `requires-python = ">=3.11"` |
