@@ -9,6 +9,7 @@ build/
 .venv/
 
 # Tooling
+temp_auto_push.bat
 .pytest_cache/
 .ruff_cache/
 .coverage
@@ -18,7 +19,8 @@ htmlcov/
 .env
 
 # Editors / OS
-.vscode/
 .idea/
 .DS_Store
 Thumbs.db
+.gitignore
+branch_structure.json
